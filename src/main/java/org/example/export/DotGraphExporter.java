@@ -3,7 +3,7 @@ package org.example.export;
 import org.example.model.DependencyEdge;
 import org.example.model.LabeledEdge;
 import org.jgrapht.Graph;
-import org.jgrapht.graph.GraphTypeBuilder;
+import org.jgrapht.graph.builder.GraphTypeBuilder;
 import org.jgrapht.nio.Attribute;
 import org.jgrapht.nio.DefaultAttribute;
 import org.jgrapht.nio.dot.DOTExporter;
