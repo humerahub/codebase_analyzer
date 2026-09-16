@@ -143,17 +143,25 @@ public final class DependencyGraphBuilder {
                               Map<String, String> beanTypeToImpl, List<DependencyEdge> edges) {
         for (CtType<?> type : allTypes) {
             String owner = type.getSimpleName();
-            boolean isSpringManaged = type.getAnnotations().stream()
+            boolean isManaged = type.getAnnotations().stream()
                     .map(a -> a.getAnnotationType().getSimpleName())
                     .anyMatch(SpringStereotypes.STEREOTYPE_ANNOTATIONS::contains);
 
             List<String> injectedTypeNames = new ArrayList<>();
 
             for (CtField<?> field : type.getFields()) {
-                boolean isFinal = field.hasModifier(ModifierKind.FINAL);
                 boolean isStatic = field.hasModifier(ModifierKind.STATIC);
+                if (isStatic) continue;
+
+                boolean hasInjectionAnnotation = field.getAnnotations().stream()
+                        .map(a -> a.getAnnotationType().getSimpleName())
+                        .anyMatch(SpringStereotypes.INJECTION_ANNOTATIONS::contains);
+
+                boolean isFinal = field.hasModifier(ModifierKind.FINAL);
                 boolean hasInitializer = field.getDefaultExpression() != null;
-                if (isFinal && !isStatic && !hasInitializer) {
+                boolean looksLikeConstructorInjection = isFinal && !hasInitializer;
+
+                if (hasInjectionAnnotation || looksLikeConstructorInjection) {
                     injectedTypeNames.add(field.getType().getSimpleName());
                 }
             }
@@ -162,9 +170,10 @@ public final class DependencyGraphBuilder {
                 var constructors = clazz.getConstructors();
                 boolean singleConstructor = constructors.size() == 1;
                 for (CtConstructor<?> ctor : constructors) {
-                    boolean hasAutowired = ctor.getAnnotations().stream()
-                            .anyMatch(a -> a.getAnnotationType().getSimpleName().equals("Autowired"));
-                    boolean isInjectionConstructor = hasAutowired || (isSpringManaged && singleConstructor);
+                    boolean hasInjectionAnnotation = ctor.getAnnotations().stream()
+                            .map(a -> a.getAnnotationType().getSimpleName())
+                            .anyMatch(SpringStereotypes.INJECTION_ANNOTATIONS::contains);
+                    boolean isInjectionConstructor = hasInjectionAnnotation || (isManaged && singleConstructor);
                     if (isInjectionConstructor) {
                         for (CtParameter<?> param : ctor.getParameters()) {
                             injectedTypeNames.add(param.getType().getSimpleName());
