@@ -3,7 +3,7 @@ package org.example.export;
 import org.example.model.DependencyEdge;
 import org.example.model.LabeledEdge;
 import org.jgrapht.Graph;
-import org.jgrapht.graph.DirectedMultigraph;
+import org.jgrapht.graph.GraphTypeBuilder;
 import org.jgrapht.nio.Attribute;
 import org.jgrapht.nio.DefaultAttribute;
 import org.jgrapht.nio.dot.DOTExporter;
@@ -21,10 +21,15 @@ public final class DotGraphExporter {
     }
 
     public static Graph<String, LabeledEdge> buildGraph(List<DependencyEdge> edges) {
-        // DirectedMultigraph, not SimpleDirectedGraph — we have real parallel edges,
+        // Directed multigraph with self-loops allowed — we have real parallel edges,
         // e.g. both a LAYER3_INJECTS and a LAYER3_RESOLVED edge between the same two
-        // nodes. A simple graph would silently collapse those into one edge.
-        Graph<String, LabeledEdge> graph = new DirectedMultigraph<>(LabeledEdge.class);
+        // nodes (a simple graph would silently collapse those into one edge), and real
+        // self-loops, e.g. a recursive method calling itself (LAYER1_CALLS A -> A).
+        Graph<String, LabeledEdge> graph = GraphTypeBuilder.<String, LabeledEdge>directed()
+                .allowingMultipleEdges(true)
+                .allowingSelfLoops(true)
+                .edgeClass(LabeledEdge.class)
+                .buildGraph();
 
         for (DependencyEdge e : edges) {
             graph.addVertex(e.from());
