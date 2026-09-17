@@ -1,0 +1,3 @@
+# Optional -- only needed for rag/compare.py (TF-IDF vs. real embedding model).
+# Pulls in torch; a much heavier install than rag/requirements.txt alone.
+sentence-transformers>=3.0
