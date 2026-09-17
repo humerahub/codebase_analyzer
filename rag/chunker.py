@@ -57,9 +57,15 @@ def _extract_file(path: str) -> list[Chunk]:
 
     try:
         tree = javalang.parse.parse(text)
-    except javalang.parser.JavaSyntaxError:
-        # Log and skip rather than guess at a broken parse.
-        print(f"[chunker] skipping {path}: javalang could not parse it")
+    except (javalang.parser.JavaSyntaxError, javalang.tokenizer.LexerError) as e:
+        # Log and skip rather than guess at a broken parse -- but log *why*,
+        # not just that it failed. javalang (unlike Spoon on the Java side)
+        # is a lightly-maintained pure-Python parser that doesn't track
+        # newer Java syntax well; on a real, long-lived codebase this is an
+        # expected, bounded gap, not a bug -- but "bounded" only holds if
+        # you can see which files and why, which the old generic message
+        # didn't give you.
+        print(f"[chunker] skipping {path}: {e}")
         return []
 
     line_starts = _line_starts(text)
