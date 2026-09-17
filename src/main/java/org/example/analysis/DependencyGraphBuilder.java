@@ -159,7 +159,10 @@ public final class DependencyGraphBuilder {
             if (!annotation.getAnnotationType().getSimpleName().equals(SpringStereotypes.QUALIFIER_ANNOTATION)) {
                 continue;
             }
-            String value = annotation.getValueAsString("value");
+            // getValues() (explicit attributes only) rather than getValue()/getValueAsString(),
+            // which fall back to reflectively loading the annotation's own class for unwritten
+            // attributes — and javax.inject.Named isn't on this tool's classpath either.
+            String value = trailingStringLiteral(annotation.getValues().get("value"));
             if (value != null && !value.isBlank()) {
                 return value;
             }
@@ -176,7 +179,13 @@ public final class DependencyGraphBuilder {
     private String extractEjbMappedNameTarget(CtElement element) {
         for (CtAnnotation<?> annotation : element.getAnnotations()) {
             if (!annotation.getAnnotationType().getSimpleName().equals("EJB")) continue;
-            String target = trailingStringLiteral(annotation.getValue("mappedName"));
+            // getValues() returns only explicitly-written attributes (e.g. skips plain "@EJB"
+            // with no mappedName) — unlike getValue(key), it never falls back to reflectively
+            // loading the annotation's own class for a default, which would blow up here since
+            // javax.ejb.EJB isn't on this tool's classpath (we only parse the target source, we
+            // don't depend on Jakarta EE itself).
+            CtExpression<?> mappedNameExpr = annotation.getValues().get("mappedName");
+            String target = trailingStringLiteral(mappedNameExpr);
             if (target != null && !target.isBlank()) {
                 return target;
             }
