@@ -23,6 +23,7 @@ import spoon.reflect.declaration.CtParameter;
 import spoon.reflect.declaration.CtType;
 import spoon.reflect.declaration.ModifierKind;
 import spoon.reflect.reference.CtExecutableReference;
+import spoon.reflect.reference.CtTypeParameterReference;
 import spoon.reflect.reference.CtTypeReference;
 import spoon.reflect.visitor.filter.TypeFilter;
 
@@ -44,6 +45,13 @@ import java.util.stream.Collectors;
  * in that fixed order.
  */
 public final class DependencyGraphBuilder {
+
+    // Excludes generic type parameters (e.g. the "T" in "class Repo<T> extends Base<T>") and
+    // primitives (e.g. "boolean") from becoming graph nodes — neither is a real, resolvable
+    // class, so treating them as one pollutes the graph with fake nodes like "T" or "boolean".
+    private static boolean isConcreteReference(CtTypeReference<?> ref) {
+        return ref != null && !ref.isPrimitive() && !(ref instanceof CtTypeParameterReference);
+    }
 
     public List<DependencyEdge> buildEdges(List<CtType<?>> allTypes) {
         // Fully-qualified names, not simple names: this codebase has genuine, unrelated
@@ -76,6 +84,7 @@ public final class DependencyGraphBuilder {
                 String qualifiedClassName = clazz.getQualifiedName();
                 String qualifier = extractQualifier(clazz);
                 for (CtTypeReference<?> superInterface : clazz.getSuperInterfaces()) {
+                    if (!isConcreteReference(superInterface)) continue;
                     String ifaceName = superInterface.getQualifiedName();
                     interfaceToImpls
                             .computeIfAbsent(ifaceName, k -> new ArrayList<>())
@@ -87,7 +96,7 @@ public final class DependencyGraphBuilder {
                     }
                 }
                 CtTypeReference<?> superclass = clazz.getSuperclass();
-                if (superclass != null && !superclass.getQualifiedName().equals("java.lang.Object")) {
+                if (isConcreteReference(superclass) && !superclass.getQualifiedName().equals("java.lang.Object")) {
                     edges.add(new DependencyEdge(qualifiedClassName, superclass.getQualifiedName(),
                             Layer.LAYER2_EXTENDS, "class inheritance"));
                 }
@@ -117,7 +126,7 @@ public final class DependencyGraphBuilder {
                         .anyMatch(SpringStereotypes.PROVIDER_ANNOTATIONS::contains);
                 if (!isProvider) continue;
 
-                String declaredType = method.getType() != null ? method.getType().getQualifiedName() : null;
+                String declaredType = isConcreteReference(method.getType()) ? method.getType().getQualifiedName() : null;
                 String resolvedType = resolveProviderReturnType(method);
                 recordProvider(edges, beanTypeToImpl, qualifiedProviders, declaredType, resolvedType,
                         extractQualifier(method), "\"" + method.getSimpleName() + "()\" returns concrete type");
@@ -129,9 +138,9 @@ public final class DependencyGraphBuilder {
                         .anyMatch(SpringStereotypes.PROVIDER_ANNOTATIONS::contains);
                 if (!isProvider) continue;
 
-                String declaredType = field.getType() != null ? field.getType().getQualifiedName() : null;
+                String declaredType = isConcreteReference(field.getType()) ? field.getType().getQualifiedName() : null;
                 String resolvedType = field.getDefaultExpression() instanceof CtConstructorCall<?> ctorCall
-                        && ctorCall.getType() != null ? ctorCall.getType().getQualifiedName() : null;
+                        && isConcreteReference(ctorCall.getType()) ? ctorCall.getType().getQualifiedName() : null;
                 recordProvider(edges, beanTypeToImpl, qualifiedProviders, declaredType, resolvedType,
                         extractQualifier(field), "field \"" + field.getSimpleName() + "\" initialized to concrete type");
             }
@@ -219,7 +228,7 @@ public final class DependencyGraphBuilder {
 
         // Case 1: return new X(...);
         if (returned instanceof CtConstructorCall<?> ctorCall) {
-            return ctorCall.getType() != null ? ctorCall.getType().getQualifiedName() : null;
+            return isConcreteReference(ctorCall.getType()) ? ctorCall.getType().getQualifiedName() : null;
         }
 
         // Case 2: X x = new X(...); ... return x;
@@ -229,7 +238,7 @@ public final class DependencyGraphBuilder {
             for (CtLocalVariable<?> local : locals) {
                 if (local.getSimpleName().equals(varName)
                         && local.getDefaultExpression() instanceof CtConstructorCall<?> ctorCall) {
-                    return ctorCall.getType() != null ? ctorCall.getType().getQualifiedName() : null;
+                    return isConcreteReference(ctorCall.getType()) ? ctorCall.getType().getQualifiedName() : null;
                 }
             }
         }
@@ -258,7 +267,7 @@ public final class DependencyGraphBuilder {
 
             for (CtField<?> field : type.getFields()) {
                 boolean isStatic = field.hasModifier(ModifierKind.STATIC);
-                if (isStatic) continue;
+                if (isStatic || !isConcreteReference(field.getType())) continue;
 
                 boolean hasInjectionAnnotation = field.getAnnotations().stream()
                         .map(a -> a.getAnnotationType().getSimpleName())
@@ -286,6 +295,7 @@ public final class DependencyGraphBuilder {
                     boolean isInjectionConstructor = hasInjectionAnnotation || (isManaged && singleConstructor);
                     if (isInjectionConstructor) {
                         for (CtParameter<?> param : ctor.getParameters()) {
+                            if (!isConcreteReference(param.getType())) continue;
                             injectionPoints.add(new InjectionPoint(param.getType().getQualifiedName(),
                                     extractQualifier(param), extractEjbMappedNameTarget(param)));
                         }
