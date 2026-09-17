@@ -44,7 +44,11 @@ import java.util.stream.Collectors;
 public final class DependencyGraphBuilder {
 
     public List<DependencyEdge> buildEdges(List<CtType<?>> allTypes) {
-        Set<String> ownTypeNames = allTypes.stream().map(CtType::getSimpleName).collect(Collectors.toSet());
+        // Fully-qualified names, not simple names: this codebase has genuine, unrelated
+        // classes sharing a simple name in different packages (e.g. two distinct
+        // InterestRateDaoImpl classes under dao.accounts and dao.setup). Matching on
+        // simple name alone would silently merge them into one node.
+        Set<String> ownTypeNames = allTypes.stream().map(CtType::getQualifiedName).collect(Collectors.toSet());
 
         List<DependencyEdge> edges = new ArrayList<>();
         Map<String, List<String>> interfaceToImpls = new HashMap<>();
@@ -67,21 +71,22 @@ public final class DependencyGraphBuilder {
                               Map<String, Map<String, String>> qualifiedImpls) {
         for (CtType<?> type : allTypes) {
             if (type instanceof CtClass<?> clazz) {
+                String qualifiedClassName = clazz.getQualifiedName();
                 String qualifier = extractQualifier(clazz);
                 for (CtTypeReference<?> superInterface : clazz.getSuperInterfaces()) {
-                    String ifaceName = superInterface.getSimpleName();
+                    String ifaceName = superInterface.getQualifiedName();
                     interfaceToImpls
                             .computeIfAbsent(ifaceName, k -> new ArrayList<>())
-                            .add(clazz.getSimpleName());
+                            .add(qualifiedClassName);
                     if (qualifier != null) {
                         qualifiedImpls
                                 .computeIfAbsent(ifaceName, k -> new HashMap<>())
-                                .put(qualifier, clazz.getSimpleName());
+                                .put(qualifier, qualifiedClassName);
                     }
                 }
                 CtTypeReference<?> superclass = clazz.getSuperclass();
-                if (superclass != null && !superclass.getSimpleName().equals("Object")) {
-                    edges.add(new DependencyEdge(clazz.getSimpleName(), superclass.getSimpleName(),
+                if (superclass != null && !superclass.getQualifiedName().equals("java.lang.Object")) {
+                    edges.add(new DependencyEdge(qualifiedClassName, superclass.getQualifiedName(),
                             Layer.LAYER2_EXTENDS, "class inheritance"));
                 }
             }
@@ -110,7 +115,7 @@ public final class DependencyGraphBuilder {
                         .anyMatch(SpringStereotypes.PROVIDER_ANNOTATIONS::contains);
                 if (!isProvider) continue;
 
-                String declaredType = method.getType() != null ? method.getType().getSimpleName() : null;
+                String declaredType = method.getType() != null ? method.getType().getQualifiedName() : null;
                 String resolvedType = resolveProviderReturnType(method);
                 recordProvider(edges, beanTypeToImpl, qualifiedProviders, declaredType, resolvedType,
                         extractQualifier(method), "\"" + method.getSimpleName() + "()\" returns concrete type");
@@ -122,9 +127,9 @@ public final class DependencyGraphBuilder {
                         .anyMatch(SpringStereotypes.PROVIDER_ANNOTATIONS::contains);
                 if (!isProvider) continue;
 
-                String declaredType = field.getType() != null ? field.getType().getSimpleName() : null;
+                String declaredType = field.getType() != null ? field.getType().getQualifiedName() : null;
                 String resolvedType = field.getDefaultExpression() instanceof CtConstructorCall<?> ctorCall
-                        && ctorCall.getType() != null ? ctorCall.getType().getSimpleName() : null;
+                        && ctorCall.getType() != null ? ctorCall.getType().getQualifiedName() : null;
                 recordProvider(edges, beanTypeToImpl, qualifiedProviders, declaredType, resolvedType,
                         extractQualifier(field), "field \"" + field.getSimpleName() + "\" initialized to concrete type");
             }
@@ -176,7 +181,7 @@ public final class DependencyGraphBuilder {
 
         // Case 1: return new X(...);
         if (returned instanceof CtConstructorCall<?> ctorCall) {
-            return ctorCall.getType() != null ? ctorCall.getType().getSimpleName() : null;
+            return ctorCall.getType() != null ? ctorCall.getType().getQualifiedName() : null;
         }
 
         // Case 2: X x = new X(...); ... return x;
@@ -186,7 +191,7 @@ public final class DependencyGraphBuilder {
             for (CtLocalVariable<?> local : locals) {
                 if (local.getSimpleName().equals(varName)
                         && local.getDefaultExpression() instanceof CtConstructorCall<?> ctorCall) {
-                    return ctorCall.getType() != null ? ctorCall.getType().getSimpleName() : null;
+                    return ctorCall.getType() != null ? ctorCall.getType().getQualifiedName() : null;
                 }
             }
         }
@@ -205,7 +210,7 @@ public final class DependencyGraphBuilder {
                               Map<String, Map<String, String>> qualifiedImpls, Map<String, String> beanTypeToImpl,
                               Map<String, Map<String, String>> qualifiedProviders, List<DependencyEdge> edges) {
         for (CtType<?> type : allTypes) {
-            String owner = type.getSimpleName();
+            String owner = type.getQualifiedName();
             boolean isManaged = type.getAnnotations().stream()
                     .map(a -> a.getAnnotationType().getSimpleName())
                     .anyMatch(SpringStereotypes.STEREOTYPE_ANNOTATIONS::contains);
@@ -227,7 +232,7 @@ public final class DependencyGraphBuilder {
                         && isAssignedFromMatchingConstructorParam(field, ownerClass);
 
                 if (hasInjectionAnnotation || looksLikeConstructorInjection) {
-                    injectionPoints.add(new InjectionPoint(field.getType().getSimpleName(), extractQualifier(field)));
+                    injectionPoints.add(new InjectionPoint(field.getType().getQualifiedName(), extractQualifier(field)));
                 }
             }
 
@@ -241,7 +246,7 @@ public final class DependencyGraphBuilder {
                     boolean isInjectionConstructor = hasInjectionAnnotation || (isManaged && singleConstructor);
                     if (isInjectionConstructor) {
                         for (CtParameter<?> param : ctor.getParameters()) {
-                            injectionPoints.add(new InjectionPoint(param.getType().getSimpleName(),
+                            injectionPoints.add(new InjectionPoint(param.getType().getQualifiedName(),
                                     extractQualifier(param)));
                         }
                     }
@@ -299,13 +304,13 @@ public final class DependencyGraphBuilder {
     // (e.g. "this.id = UUID.randomUUID();"), which isn't a dependency at all.
     private boolean isAssignedFromMatchingConstructorParam(CtField<?> field, CtClass<?> clazz) {
         String fieldName = field.getSimpleName();
-        String fieldType = field.getType().getSimpleName();
+        String fieldType = field.getType().getQualifiedName();
 
         for (CtConstructor<?> ctor : clazz.getConstructors()) {
             if (ctor.getBody() == null) continue;
 
             Set<String> matchingParamNames = ctor.getParameters().stream()
-                    .filter(p -> p.getType().getSimpleName().equals(fieldType))
+                    .filter(p -> p.getType().getQualifiedName().equals(fieldType))
                     .map(CtParameter::getSimpleName)
                     .collect(Collectors.toSet());
             if (matchingParamNames.isEmpty()) continue;
@@ -329,14 +334,14 @@ public final class DependencyGraphBuilder {
     private void buildLayer1(List<CtType<?>> allTypes, Set<String> ownTypeNames, List<DependencyEdge> edges) {
         for (CtType<?> type : allTypes) {
             for (CtMethod<?> method : type.getMethods()) {
-                String caller = type.getSimpleName() + "." + method.getSimpleName() + "()";
+                String caller = type.getQualifiedName() + "." + method.getSimpleName() + "()";
                 List<CtInvocation<?>> invocations = method.getElements(new TypeFilter<>(CtInvocation.class));
                 for (CtInvocation<?> invocation : invocations) {
                     CtExecutableReference<?> exec = invocation.getExecutable();
                     if (exec == null) continue;
                     CtTypeReference<?> declaringType = exec.getDeclaringType();
                     if (declaringType == null) continue;
-                    String calleeType = declaringType.getSimpleName();
+                    String calleeType = declaringType.getQualifiedName();
                     if (!ownTypeNames.contains(calleeType)) continue; // skip java.*, Spring internals, etc. — noise
                     String callee = calleeType + "." + exec.getSimpleName() + "()";
                     edges.add(new DependencyEdge(caller, callee, Layer.LAYER1_CALLS, "direct method call"));
