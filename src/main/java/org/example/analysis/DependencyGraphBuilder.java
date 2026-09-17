@@ -4,10 +4,12 @@ import org.example.model.DependencyEdge;
 import org.example.model.Layer;
 import org.example.model.SpringStereotypes;
 import spoon.reflect.code.CtAssignment;
+import spoon.reflect.code.CtBinaryOperator;
 import spoon.reflect.code.CtConstructorCall;
 import spoon.reflect.code.CtExpression;
 import spoon.reflect.code.CtFieldWrite;
 import spoon.reflect.code.CtInvocation;
+import spoon.reflect.code.CtLiteral;
 import spoon.reflect.code.CtLocalVariable;
 import spoon.reflect.code.CtReturn;
 import spoon.reflect.code.CtVariableRead;
@@ -165,6 +167,33 @@ public final class DependencyGraphBuilder {
         return null;
     }
 
+    // Reads @EJB(mappedName = SOME_PREFIX + "TargetBeanClassName") off a field/parameter —
+    // a second, distinct disambiguation mechanism from @Named. The value is usually a string
+    // concatenation (a shared JNDI prefix + the literal bean name), not a plain literal, so this
+    // walks to the rightmost operand of any concatenation chain to find that trailing literal.
+    // Returns the simple class name the mappedName is pointing at, or null if @EJB has no
+    // mappedName, or its value isn't ultimately a string literal we can read statically.
+    private String extractEjbMappedNameTarget(CtElement element) {
+        for (CtAnnotation<?> annotation : element.getAnnotations()) {
+            if (!annotation.getAnnotationType().getSimpleName().equals("EJB")) continue;
+            String target = trailingStringLiteral(annotation.getValue("mappedName"));
+            if (target != null && !target.isBlank()) {
+                return target;
+            }
+        }
+        return null;
+    }
+
+    private String trailingStringLiteral(CtExpression<?> expr) {
+        if (expr instanceof CtLiteral<?> literal && literal.getValue() instanceof String s) {
+            return s;
+        }
+        if (expr instanceof CtBinaryOperator<?> binaryOperator) {
+            return trailingStringLiteral(binaryOperator.getRightHandOperand());
+        }
+        return null;
+    }
+
     // Resolves what a @Bean/@Produces method actually constructs, for the simple/unambiguous case only.
     // Returns null if the method doesn't have exactly one return statement, or that return
     // isn't a direct/one-hop-via-local-variable "new X()" — e.g. it delegates to another
@@ -200,8 +229,9 @@ public final class DependencyGraphBuilder {
         return null;
     }
 
-    // An injection point: the type asked for, plus its @Named qualifier if it has one.
-    private record InjectionPoint(String typeName, String qualifier) {
+    // An injection point: the type asked for, plus its @Named qualifier and/or
+    // @EJB(mappedName=...) target, if it has either.
+    private record InjectionPoint(String typeName, String namedQualifier, String ejbMappedNameTarget) {
     }
 
     // ---------- Layer 3: DI wiring, resolved through the Layer 2 + provider registries ----------
@@ -232,7 +262,8 @@ public final class DependencyGraphBuilder {
                         && isAssignedFromMatchingConstructorParam(field, ownerClass);
 
                 if (hasInjectionAnnotation || looksLikeConstructorInjection) {
-                    injectionPoints.add(new InjectionPoint(field.getType().getQualifiedName(), extractQualifier(field)));
+                    injectionPoints.add(new InjectionPoint(field.getType().getQualifiedName(),
+                            extractQualifier(field), extractEjbMappedNameTarget(field)));
                 }
             }
 
@@ -247,7 +278,7 @@ public final class DependencyGraphBuilder {
                     if (isInjectionConstructor) {
                         for (CtParameter<?> param : ctor.getParameters()) {
                             injectionPoints.add(new InjectionPoint(param.getType().getQualifiedName(),
-                                    extractQualifier(param)));
+                                    extractQualifier(param), extractEjbMappedNameTarget(param)));
                         }
                     }
                 }
@@ -260,28 +291,40 @@ public final class DependencyGraphBuilder {
                 // Try qualifier-based resolution first, when the injection point named one
                 // (e.g. @Named("stripe")) — this is what lets a genuinely multi-implementation
                 // type resolve unambiguously instead of falling through to LAYER3_AMBIGUOUS.
-                String qualifiedImpl = point.qualifier() == null ? null
-                        : qualifiedProviders.getOrDefault(injectedType, Map.of()).get(point.qualifier());
-                if (qualifiedImpl == null && point.qualifier() != null) {
-                    qualifiedImpl = qualifiedImpls.getOrDefault(injectedType, Map.of()).get(point.qualifier());
+                String qualifiedImpl = point.namedQualifier() == null ? null
+                        : qualifiedProviders.getOrDefault(injectedType, Map.of()).get(point.namedQualifier());
+                if (qualifiedImpl == null && point.namedQualifier() != null) {
+                    qualifiedImpl = qualifiedImpls.getOrDefault(injectedType, Map.of()).get(point.namedQualifier());
+                }
+
+                List<String> impls = interfaceToImpls.get(injectedType);
+
+                // Second disambiguation path: @EJB(mappedName = ... + "TargetBeanClassName")
+                // names the target implementation's simple class name directly, rather than
+                // via a shared qualifier value — match it against the candidate implementations.
+                if (qualifiedImpl == null && point.ejbMappedNameTarget() != null && impls != null) {
+                    qualifiedImpl = impls.stream()
+                            .filter(impl -> impl.equals(point.ejbMappedNameTarget())
+                                    || impl.endsWith("." + point.ejbMappedNameTarget()))
+                            .findFirst()
+                            .orElse(null);
                 }
 
                 if (qualifiedImpl != null) {
-                    edges.add(new DependencyEdge(owner, qualifiedImpl, Layer.LAYER3_RESOLVED,
-                            "DI resolved via @Named(\"" + point.qualifier() + "\") qualifier match"));
-                } else {
-                    List<String> impls = interfaceToImpls.get(injectedType);
-                    if (impls != null) {
-                        if (impls.size() == 1) {
-                            // OrderService -> StripePaymentService: resolve the interface
-                            // injection to the real concrete class.
-                            edges.add(new DependencyEdge(owner, impls.get(0),
-                                    Layer.LAYER3_RESOLVED, "DI resolved via unique implementation"));
-                        } else {
-                            // Multiple implementations and no qualifier resolved one — flag it, don't guess.
-                            edges.add(new DependencyEdge(owner, injectedType, Layer.LAYER3_AMBIGUOUS,
-                                    "multiple implementations (" + String.join(", ", impls) + ") - review recommended"));
-                        }
+                    String via = point.namedQualifier() != null
+                            ? "@Named(\"" + point.namedQualifier() + "\") qualifier match"
+                            : "@EJB(mappedName=\"" + point.ejbMappedNameTarget() + "\") match";
+                    edges.add(new DependencyEdge(owner, qualifiedImpl, Layer.LAYER3_RESOLVED, "DI resolved via " + via));
+                } else if (impls != null) {
+                    if (impls.size() == 1) {
+                        // OrderService -> StripePaymentService: resolve the interface
+                        // injection to the real concrete class.
+                        edges.add(new DependencyEdge(owner, impls.get(0),
+                                Layer.LAYER3_RESOLVED, "DI resolved via unique implementation"));
+                    } else {
+                        // Multiple implementations and nothing resolved one — flag it, don't guess.
+                        edges.add(new DependencyEdge(owner, injectedType, Layer.LAYER3_AMBIGUOUS,
+                                "multiple implementations (" + String.join(", ", impls) + ") - review recommended"));
                     }
                 }
 
