@@ -18,6 +18,12 @@ public final class SpringStereotypes {
             "Autowired", "Inject", "EJB", "Resource"
     );
 
+    /** Annotations that mark a method/field as a factory that provides a bean instance. */
+    public static final Set<String> PROVIDER_ANNOTATIONS = Set.of("Bean", "Produces");
+
+    /** The qualifier annotation used to disambiguate between multiple implementations by name. */
+    public static final String QUALIFIER_ANNOTATION = "Named";
+
     private SpringStereotypes() {
     }
 }

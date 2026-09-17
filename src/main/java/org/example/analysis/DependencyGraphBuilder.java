@@ -3,14 +3,18 @@ package org.example.analysis;
 import org.example.model.DependencyEdge;
 import org.example.model.Layer;
 import org.example.model.SpringStereotypes;
+import spoon.reflect.code.CtAssignment;
 import spoon.reflect.code.CtConstructorCall;
 import spoon.reflect.code.CtExpression;
+import spoon.reflect.code.CtFieldWrite;
 import spoon.reflect.code.CtInvocation;
 import spoon.reflect.code.CtLocalVariable;
 import spoon.reflect.code.CtReturn;
 import spoon.reflect.code.CtVariableRead;
+import spoon.reflect.declaration.CtAnnotation;
 import spoon.reflect.declaration.CtClass;
 import spoon.reflect.declaration.CtConstructor;
+import spoon.reflect.declaration.CtElement;
 import spoon.reflect.declaration.CtField;
 import spoon.reflect.declaration.CtMethod;
 import spoon.reflect.declaration.CtParameter;
@@ -43,23 +47,37 @@ public final class DependencyGraphBuilder {
         Set<String> ownTypeNames = allTypes.stream().map(CtType::getSimpleName).collect(Collectors.toSet());
 
         List<DependencyEdge> edges = new ArrayList<>();
-        Map<String, List<String>> interfaceToImpls = buildLayer2(allTypes, edges);
-        Map<String, String> beanTypeToImpl = buildBeanRegistry(allTypes, edges);
-        buildLayer3(allTypes, interfaceToImpls, beanTypeToImpl, edges);
+        Map<String, List<String>> interfaceToImpls = new HashMap<>();
+        Map<String, Map<String, String>> qualifiedImpls = new HashMap<>();
+        buildLayer2(allTypes, edges, interfaceToImpls, qualifiedImpls);
+
+        Map<String, String> beanTypeToImpl = new HashMap<>();
+        Map<String, Map<String, String>> qualifiedProviders = new HashMap<>();
+        buildProviderRegistry(allTypes, edges, beanTypeToImpl, qualifiedProviders);
+
+        buildLayer3(allTypes, interfaceToImpls, qualifiedImpls, beanTypeToImpl, qualifiedProviders, edges);
         buildLayer1(allTypes, ownTypeNames, edges);
         return edges;
     }
 
     // ---------- Layer 2: interface -> implementation registry, class inheritance ----------
 
-    private Map<String, List<String>> buildLayer2(List<CtType<?>> allTypes, List<DependencyEdge> edges) {
-        Map<String, List<String>> interfaceToImpls = new HashMap<>();
+    private void buildLayer2(List<CtType<?>> allTypes, List<DependencyEdge> edges,
+                              Map<String, List<String>> interfaceToImpls,
+                              Map<String, Map<String, String>> qualifiedImpls) {
         for (CtType<?> type : allTypes) {
             if (type instanceof CtClass<?> clazz) {
+                String qualifier = extractQualifier(clazz);
                 for (CtTypeReference<?> superInterface : clazz.getSuperInterfaces()) {
+                    String ifaceName = superInterface.getSimpleName();
                     interfaceToImpls
-                            .computeIfAbsent(superInterface.getSimpleName(), k -> new ArrayList<>())
+                            .computeIfAbsent(ifaceName, k -> new ArrayList<>())
                             .add(clazz.getSimpleName());
+                    if (qualifier != null) {
+                        qualifiedImpls
+                                .computeIfAbsent(ifaceName, k -> new HashMap<>())
+                                .put(qualifier, clazz.getSimpleName());
+                    }
                 }
                 CtTypeReference<?> superclass = clazz.getSuperclass();
                 if (superclass != null && !superclass.getSimpleName().equals("Object")) {
@@ -71,43 +89,83 @@ public final class DependencyGraphBuilder {
         interfaceToImpls.forEach((iface, impls) ->
                 impls.forEach(impl -> edges.add(new DependencyEdge(iface, impl,
                         Layer.LAYER2_IMPLEMENTED_BY, "interface -> implementation"))));
-        return interfaceToImpls;
     }
 
-    // ---------- Layer 3b: @Bean method registry ----------
+    // ---------- Layer 3b: @Bean / @Produces provider registry ----------
     // Handles cases interfaceToImpls can't: the impl isn't "implements X" in our
-    // source, it's constructed inside a @Bean factory method, e.g.
+    // source, it's constructed inside a factory method or field, e.g.
     //   @Bean public PasswordEncoder passwordEncoder() { return new BCryptPasswordEncoder(); }
-    // Only resolves the simple, unambiguous case — see resolveBeanReturnType().
+    //   @Produces public PaymentService paymentService() { return new StripePaymentService(); }
+    // Only resolves the simple, unambiguous case — see resolveProviderReturnType().
+    // Providers additionally qualified with @Named("x") are recorded separately so
+    // injection points asking for that exact qualifier can resolve unambiguously.
 
-    private Map<String, String> buildBeanRegistry(List<CtType<?>> allTypes, List<DependencyEdge> edges) {
-        Map<String, String> beanTypeToImpl = new HashMap<>();
+    private void buildProviderRegistry(List<CtType<?>> allTypes, List<DependencyEdge> edges,
+                                        Map<String, String> beanTypeToImpl,
+                                        Map<String, Map<String, String>> qualifiedProviders) {
         for (CtType<?> type : allTypes) {
             for (CtMethod<?> method : type.getMethods()) {
-                boolean isBean = method.getAnnotations().stream()
-                        .anyMatch(a -> a.getAnnotationType().getSimpleName().equals("Bean"));
-                if (!isBean) continue;
+                boolean isProvider = method.getAnnotations().stream()
+                        .map(a -> a.getAnnotationType().getSimpleName())
+                        .anyMatch(SpringStereotypes.PROVIDER_ANNOTATIONS::contains);
+                if (!isProvider) continue;
 
                 String declaredType = method.getType() != null ? method.getType().getSimpleName() : null;
-                String resolvedType = resolveBeanReturnType(method);
+                String resolvedType = resolveProviderReturnType(method);
+                recordProvider(edges, beanTypeToImpl, qualifiedProviders, declaredType, resolvedType,
+                        extractQualifier(method), "\"" + method.getSimpleName() + "()\" returns concrete type");
+            }
 
-                if (resolvedType != null && !resolvedType.equals(declaredType)) {
-                    beanTypeToImpl.put(declaredType, resolvedType);
-                    edges.add(new DependencyEdge(declaredType, resolvedType,
-                            Layer.LAYER3_BEAN_PROVIDES,
-                            "@Bean method \"" + method.getSimpleName() + "()\" returns concrete type"));
-                }
+            for (CtField<?> field : type.getFields()) {
+                boolean isProvider = field.getAnnotations().stream()
+                        .map(a -> a.getAnnotationType().getSimpleName())
+                        .anyMatch(SpringStereotypes.PROVIDER_ANNOTATIONS::contains);
+                if (!isProvider) continue;
+
+                String declaredType = field.getType() != null ? field.getType().getSimpleName() : null;
+                String resolvedType = field.getDefaultExpression() instanceof CtConstructorCall<?> ctorCall
+                        && ctorCall.getType() != null ? ctorCall.getType().getSimpleName() : null;
+                recordProvider(edges, beanTypeToImpl, qualifiedProviders, declaredType, resolvedType,
+                        extractQualifier(field), "field \"" + field.getSimpleName() + "\" initialized to concrete type");
             }
         }
-        return beanTypeToImpl;
     }
 
-    // Resolves what a @Bean method actually constructs, for the simple/unambiguous case only.
+    private void recordProvider(List<DependencyEdge> edges, Map<String, String> beanTypeToImpl,
+                                 Map<String, Map<String, String>> qualifiedProviders,
+                                 String declaredType, String resolvedType, String qualifier, String detailSuffix) {
+        if (resolvedType == null || resolvedType.equals(declaredType)) return;
+
+        beanTypeToImpl.put(declaredType, resolvedType);
+        if (qualifier != null) {
+            qualifiedProviders.computeIfAbsent(declaredType, k -> new HashMap<>()).put(qualifier, resolvedType);
+        }
+        edges.add(new DependencyEdge(declaredType, resolvedType,
+                Layer.LAYER3_BEAN_PROVIDES, "@Bean/@Produces " + detailSuffix));
+    }
+
+    // Reads a @Named("value") annotation's string literal off a class, method, field, or
+    // parameter — the qualifier used to pick between multiple candidates for the same type.
+    // Returns null when there's no @Named annotation, or its value isn't a plain string literal.
+    private String extractQualifier(CtElement element) {
+        for (CtAnnotation<?> annotation : element.getAnnotations()) {
+            if (!annotation.getAnnotationType().getSimpleName().equals(SpringStereotypes.QUALIFIER_ANNOTATION)) {
+                continue;
+            }
+            String value = annotation.getValueAsString("value");
+            if (value != null && !value.isBlank()) {
+                return value;
+            }
+        }
+        return null;
+    }
+
+    // Resolves what a @Bean/@Produces method actually constructs, for the simple/unambiguous case only.
     // Returns null if the method doesn't have exactly one return statement, or that return
     // isn't a direct/one-hop-via-local-variable "new X()" — e.g. it delegates to another
     // method or object (authenticationManager() calling authenticationConfiguration.get...()),
     // which is a real "can't resolve statically" case, not a bug in this scan.
-    private String resolveBeanReturnType(CtMethod<?> method) {
+    private String resolveProviderReturnType(CtMethod<?> method) {
         if (method.getBody() == null) return null;
 
         List<CtReturn<?>> returns = method.getBody().getElements(new TypeFilter<>(CtReturn.class));
@@ -137,17 +195,22 @@ public final class DependencyGraphBuilder {
         return null;
     }
 
-    // ---------- Layer 3: Spring DI wiring, resolved through the Layer 2 + bean registries ----------
+    // An injection point: the type asked for, plus its @Named qualifier if it has one.
+    private record InjectionPoint(String typeName, String qualifier) {
+    }
+
+    // ---------- Layer 3: DI wiring, resolved through the Layer 2 + provider registries ----------
 
     private void buildLayer3(List<CtType<?>> allTypes, Map<String, List<String>> interfaceToImpls,
-                              Map<String, String> beanTypeToImpl, List<DependencyEdge> edges) {
+                              Map<String, Map<String, String>> qualifiedImpls, Map<String, String> beanTypeToImpl,
+                              Map<String, Map<String, String>> qualifiedProviders, List<DependencyEdge> edges) {
         for (CtType<?> type : allTypes) {
             String owner = type.getSimpleName();
             boolean isManaged = type.getAnnotations().stream()
                     .map(a -> a.getAnnotationType().getSimpleName())
                     .anyMatch(SpringStereotypes.STEREOTYPE_ANNOTATIONS::contains);
 
-            List<String> injectedTypeNames = new ArrayList<>();
+            List<InjectionPoint> injectionPoints = new ArrayList<>();
 
             for (CtField<?> field : type.getFields()) {
                 boolean isStatic = field.hasModifier(ModifierKind.STATIC);
@@ -159,10 +222,12 @@ public final class DependencyGraphBuilder {
 
                 boolean isFinal = field.hasModifier(ModifierKind.FINAL);
                 boolean hasInitializer = field.getDefaultExpression() != null;
-                boolean looksLikeConstructorInjection = isFinal && !hasInitializer;
+                boolean looksLikeConstructorInjection = isFinal && !hasInitializer
+                        && type instanceof CtClass<?> ownerClass
+                        && isAssignedFromMatchingConstructorParam(field, ownerClass);
 
                 if (hasInjectionAnnotation || looksLikeConstructorInjection) {
-                    injectedTypeNames.add(field.getType().getSimpleName());
+                    injectionPoints.add(new InjectionPoint(field.getType().getSimpleName(), extractQualifier(field)));
                 }
             }
 
@@ -176,38 +241,87 @@ public final class DependencyGraphBuilder {
                     boolean isInjectionConstructor = hasInjectionAnnotation || (isManaged && singleConstructor);
                     if (isInjectionConstructor) {
                         for (CtParameter<?> param : ctor.getParameters()) {
-                            injectedTypeNames.add(param.getType().getSimpleName());
+                            injectionPoints.add(new InjectionPoint(param.getType().getSimpleName(),
+                                    extractQualifier(param)));
                         }
                     }
                 }
             }
 
-            for (String injectedType : injectedTypeNames) {
+            for (InjectionPoint point : injectionPoints) {
+                String injectedType = point.typeName();
                 edges.add(new DependencyEdge(owner, injectedType, Layer.LAYER3_INJECTS, "field/constructor injection"));
 
-                List<String> impls = interfaceToImpls.get(injectedType);
-                if (impls != null) {
-                    if (impls.size() == 1) {
-                        // OrderService -> StripePaymentService: resolve the interface
-                        // injection to the real concrete class.
-                        edges.add(new DependencyEdge(owner, impls.get(0),
-                                Layer.LAYER3_RESOLVED, "DI resolved via unique implementation"));
-                    } else {
-                        // Multiple implementations, no @Qualifier logic built yet — flag it, don't guess.
-                        edges.add(new DependencyEdge(owner, injectedType, Layer.LAYER3_AMBIGUOUS,
-                                "multiple implementations (" + String.join(", ", impls) + ") - review recommended"));
+                // Try qualifier-based resolution first, when the injection point named one
+                // (e.g. @Named("stripe")) — this is what lets a genuinely multi-implementation
+                // type resolve unambiguously instead of falling through to LAYER3_AMBIGUOUS.
+                String qualifiedImpl = point.qualifier() == null ? null
+                        : qualifiedProviders.getOrDefault(injectedType, Map.of()).get(point.qualifier());
+                if (qualifiedImpl == null && point.qualifier() != null) {
+                    qualifiedImpl = qualifiedImpls.getOrDefault(injectedType, Map.of()).get(point.qualifier());
+                }
+
+                if (qualifiedImpl != null) {
+                    edges.add(new DependencyEdge(owner, qualifiedImpl, Layer.LAYER3_RESOLVED,
+                            "DI resolved via @Named(\"" + point.qualifier() + "\") qualifier match"));
+                } else {
+                    List<String> impls = interfaceToImpls.get(injectedType);
+                    if (impls != null) {
+                        if (impls.size() == 1) {
+                            // OrderService -> StripePaymentService: resolve the interface
+                            // injection to the real concrete class.
+                            edges.add(new DependencyEdge(owner, impls.get(0),
+                                    Layer.LAYER3_RESOLVED, "DI resolved via unique implementation"));
+                        } else {
+                            // Multiple implementations and no qualifier resolved one — flag it, don't guess.
+                            edges.add(new DependencyEdge(owner, injectedType, Layer.LAYER3_AMBIGUOUS,
+                                    "multiple implementations (" + String.join(", ", impls) + ") - review recommended"));
+                        }
                     }
                 }
 
-                // Same idea, but resolved via a @Bean factory method instead of "implements X"
+                // Same idea, but resolved via a @Bean/@Produces factory instead of "implements X"
                 // — e.g. PasswordEncoder -> BCryptPasswordEncoder from SecurityFilter.passwordEncoder().
                 String beanImpl = beanTypeToImpl.get(injectedType);
                 if (beanImpl != null) {
                     edges.add(new DependencyEdge(owner, beanImpl,
-                            Layer.LAYER3_BEAN_RESOLVED, "DI resolved via @Bean method"));
+                            Layer.LAYER3_BEAN_RESOLVED, "DI resolved via @Bean/@Produces method"));
                 }
             }
         }
+    }
+
+    // Constructor-injection heuristic for a final field with no inline initializer: only
+    // count it as injected if some constructor (a) takes a parameter of the same type as
+    // the field, and (b) actually assigns that exact parameter to the field in its body
+    // (e.g. "this.paymentService = paymentService;"). Just being final+uninitialized isn't
+    // enough on its own — that also matches fields set to a locally computed value
+    // (e.g. "this.id = UUID.randomUUID();"), which isn't a dependency at all.
+    private boolean isAssignedFromMatchingConstructorParam(CtField<?> field, CtClass<?> clazz) {
+        String fieldName = field.getSimpleName();
+        String fieldType = field.getType().getSimpleName();
+
+        for (CtConstructor<?> ctor : clazz.getConstructors()) {
+            if (ctor.getBody() == null) continue;
+
+            Set<String> matchingParamNames = ctor.getParameters().stream()
+                    .filter(p -> p.getType().getSimpleName().equals(fieldType))
+                    .map(CtParameter::getSimpleName)
+                    .collect(Collectors.toSet());
+            if (matchingParamNames.isEmpty()) continue;
+
+            List<CtAssignment<?, ?>> assignments = ctor.getBody().getElements(new TypeFilter<>(CtAssignment.class));
+            for (CtAssignment<?, ?> assignment : assignments) {
+                boolean assignsThisField = assignment.getAssigned() instanceof CtFieldWrite<?> fw
+                        && fw.getVariable().getSimpleName().equals(fieldName);
+                boolean fromMatchingParam = assignment.getAssignment() instanceof CtVariableRead<?> vr
+                        && matchingParamNames.contains(vr.getVariable().getSimpleName());
+                if (assignsThisField && fromMatchingParam) {
+                    return true;
+                }
+            }
+        }
+        return false;
     }
 
     // ---------- Layer 1: direct method call graph, filtered to our own code ----------
