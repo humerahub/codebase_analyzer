@@ -4,6 +4,7 @@ import org.example.analysis.DependencyGraphBuilder;
 import org.example.analysis.SpoonModelLoader;
 import org.example.config.AppConfig;
 import org.example.export.DotGraphExporter;
+import org.example.export.JsonGraphExporter;
 import org.example.model.DependencyEdge;
 import org.example.model.LabeledEdge;
 import org.example.report.ConsoleReporter;
@@ -28,5 +29,7 @@ public class Main {
 
         Graph<String, LabeledEdge> graph = DotGraphExporter.buildGraph(edges);
         DotGraphExporter.export(graph, AppConfig.DOT_OUTPUT_PATH);
+
+        JsonGraphExporter.export(edges, AppConfig.JSON_OUTPUT_PATH);
     }
 }

@@ -9,6 +9,7 @@ public final class AppConfig {
 
     public static final String SOURCE_ROOT;
     public static final String DOT_OUTPUT_PATH;
+    public static final String JSON_OUTPUT_PATH;
 
     static {
         Properties props = new Properties();
@@ -23,6 +24,7 @@ public final class AppConfig {
 
         SOURCE_ROOT = props.getProperty("source.root");
         DOT_OUTPUT_PATH = props.getProperty("dot.output.path");
+        JSON_OUTPUT_PATH = props.getProperty("json.output.path");
     }
 
     private AppConfig() {
