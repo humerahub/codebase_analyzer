@@ -2,3 +2,5 @@
 .idea/
 target/
 src/main/resources/application.properties
+dependency-graph.dot
+dependency-graph.json
