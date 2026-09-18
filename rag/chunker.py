@@ -63,9 +63,17 @@ def _extract_file(path: str) -> list[Chunk]:
         # is a lightly-maintained pure-Python parser that doesn't track
         # newer Java syntax well; on a real, long-lived codebase this is an
         # expected, bounded gap, not a bug -- but "bounded" only holds if
-        # you can see which files and why, which the old generic message
-        # didn't give you.
-        print(f"[chunker] skipping {path}: {e}")
+        # you can see which files and why.
+        #
+        # str(e) alone is misleading here: JavaSyntaxError stores its real
+        # message in a .description attribute (plus .at for position)
+        # instead of passing it through Exception's own message, so str(e)
+        # on it silently comes back empty. LexerError doesn't have that
+        # problem -- str(e) works fine for it -- so try .description first,
+        # fall back to str(e), and repr(e) only as a last resort.
+        reason = getattr(e, "description", None) or str(e) or repr(e)
+        at = getattr(e, "at", None)
+        print(f"[chunker] skipping {path}: {reason}" + (f" (at {at})" if at else ""))
         return []
 
     line_starts = _line_starts(text)
